@@ -58,7 +58,7 @@ public class DataVolumeModel extends BaseDatabindingModel
 
 	private boolean selected;
 
-	
+
 	/**
 	 * Default constructor
 	 */
@@ -67,7 +67,7 @@ public class DataVolumeModel extends BaseDatabindingModel
 
 	/**
 	 * Constructor
-	 * 
+	 *
 	 * @param containerPath
 	 *            the container path
 	 */
@@ -147,12 +147,12 @@ public class DataVolumeModel extends BaseDatabindingModel
 
 	/**
 	 * creates a {@link DataVolumeModel} from the 'volumeFrom' container info
-	 * 
+	 *
 	 * @param volumeFrom
 	 *            the value to parse.
-	 * 
+	 *
 	 *            Format: <code>&lt;containerName&gt;</code>
-	 * 
+	 *
 	 * @See <a href="https://docs.docker.com/engine/userguide/dockervolumes/">
 	 *      https://docs.docker.com/engine/userguide/dockervolumes/</a>
 	 */
@@ -166,18 +166,18 @@ public class DataVolumeModel extends BaseDatabindingModel
 
 	/**
 	 * creates a {@link DataVolumeModel} from the 'volumeFrom' container info
-	 * 
+	 *
 	 * @param volumeFrom
 	 *            the value to parse. Format:
 	 *            <code>&lt;host_path&gt;:&lt;container_path&gt;:&lt;label_suffix_flag&gt;</code>
-	 * 
+	 *
 	 * @See <a href="https://docs.docker.com/engine/userguide/dockervolumes/">
 	 *      https://docs.docker.com/engine/userguide/dockervolumes/</a>
 	 */
 	public static DataVolumeModel parseHostBinding(String volumeFrom) {
 		final DataVolumeModel model = new DataVolumeModel();
 		final String[] items = volumeFrom.split(SEPARATOR); // $NON-NLS-1$
-		// converts the host path to a valid Win32 path if Platform OS is Win32 
+		// converts the host path to a valid Win32 path if Platform OS is Win32
 		model.setHostPathMount(
 				LaunchConfigurationUtils.convertToWin32Path(items[0]));
 		model.containerPath = items[1];

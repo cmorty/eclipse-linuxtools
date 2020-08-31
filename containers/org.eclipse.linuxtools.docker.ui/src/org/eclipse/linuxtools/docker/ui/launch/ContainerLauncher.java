@@ -1,6 +1,6 @@
 /*******************************************************************************
  * Copyright (c) 2015, 2019 Red Hat Inc. and others.
- * 
+ *
  * This program and the accompanying materials are made
  * available under the terms of the Eclipse Public License 2.0
  * which is available at https://www.eclipse.org/legal/epl-2.0/
@@ -26,8 +26,8 @@ import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.OutputStream;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -64,6 +64,7 @@ import org.eclipse.linuxtools.docker.core.IDockerImageInfo;
 import org.eclipse.linuxtools.docker.core.IDockerPortBinding;
 import org.eclipse.linuxtools.docker.core.IDockerVolume;
 import org.eclipse.linuxtools.docker.ui.Activator;
+import org.eclipse.linuxtools.internal.docker.core.ContainerFileProxy;
 import org.eclipse.linuxtools.internal.docker.core.DockerConnection;
 import org.eclipse.linuxtools.internal.docker.core.DockerConsoleOutputStream;
 import org.eclipse.linuxtools.internal.docker.core.DockerContainerConfig;
@@ -96,9 +97,11 @@ public class ContainerLauncher {
 
 	private static Map<IProject, ID> fidMap = new HashMap<>();
 
+
 	private static Object lockObject = new Object();
 	private static Map<String, Map<String, Set<String>>> copiedVolumesMap = null;
 	private static Map<String, Map<String, Set<String>>> copyingVolumesMap = null;
+
 
 	private static Set<PosixFilePermission> toPerms(int mode) {
 		Set<PosixFilePermission> perms = new HashSet<>();
@@ -176,7 +179,7 @@ public class ContainerLauncher {
 				monitor.setTaskName(Messages
 						.getFormattedString(COPY_VOLUMES_TASK, hostDirectory));
 				try {
-					((DockerConnection) connection).copyToContainer(
+					connection.copyToContainer(
 							hostDirectory, containerId, containerDirectory);
 					monitor.worked(1);
 				} catch (DockerException | InterruptedException
@@ -224,14 +227,14 @@ public class ContainerLauncher {
 
 		private final List<String> volumes;
 		private final List<String> excludedDirs;
-		private final IDockerConnection connection;
+		private final DockerConnection connection;
 		private final String image;
 		private final IPath target;
 		private Set<String> dirList;
 		private Set<String> copyingList;
 
 		public CopyVolumesFromImageJob(
-				IDockerConnection connection,
+				DockerConnection connection,
 				String image, List<String> volumes, List<String> excludedDirs,
 				IPath target) {
 			super(Messages.getString(COPY_VOLUMES_FROM_JOB_TITLE));
@@ -267,20 +270,123 @@ public class ContainerLauncher {
 			}
 		}
 
+
+
+		private final class SymLink {
+			public final File filename;
+			public final File dockertarget;
+			public final File targetpath;
+
+			@SuppressWarnings("unused")
+			public SymLink(File filename, File dockertarget) {
+				this.filename = filename;
+				this.dockertarget = dockertarget;
+				targetpath = target.append(dockertarget.toString()).toFile();
+			}
+
+			public SymLink(File filename, String volume, TarArchiveEntry te) {
+				this.filename = filename;
+
+				IPath dltf = new Path(te.getLinkName());
+				if (!dltf.isAbsolute()) {
+					dltf = new Path(volume).removeLastSegments(1);
+					dltf = dltf.append(te.getName());
+					dltf = dltf.removeLastSegments(1);
+					dltf = dltf.append(te.getLinkName());
+				}
+				dockertarget = dltf.toFile();
+				targetpath = target.append(dltf).toFile();
+			}
+
+			public boolean targetExists() {
+				return targetpath.exists();
+			}
+
+			public boolean create() throws IOException {
+				// The path in the docker
+
+				if (!filename.toString().startsWith(target.toFile().toString())
+						|| !targetpath.toString().startsWith(target.toFile().toString())) {
+					throw new RuntimeException("aHHH");
+				}
+
+				if (!targetExists()) {
+					return false;
+				}
+
+				try {
+					Files.createSymbolicLink(filename.toPath(), targetpath.toPath());
+				} catch (FileSystemException e) {
+					String msg = "Failed to create symlink: " + filename.getAbsolutePath();
+					if (Platform.getOS().equals(Platform.OS_WIN32)) {
+						msg += "\nTo get the permissions to create symbolic links go to "
+								+ "secpol.msc > Security Settings > Local Policies > User Rights Assignment -> Add Yourself";
+					}
+					Activator.logErrorMessage(msg, e);
+				}
+				return true;
+			}
+		}
+
+		IPath mkdirSyms(String containerId, IPath path) throws DockerException, IOException {
+			// TODO: Handle path not a dir
+			for (int i = 0; i < path.segmentCount(); i++) {
+				//Create Dir - Do chamod?
+				IPath curpath = path.uptoSegment(i);
+
+
+				//Get listing
+				List<ContainerFileProxy> dir = connection.readContainerDirectory(containerId, curpath.toString());
+				if (dir.isEmpty()) {
+					Activator.logWarningMessage("Somthing went wrong getting " + path.toString());
+				}
+				String nextp = path.segments()[i];
+
+				//Get next element
+				ContainerFileProxy e = dir.stream().filter(ent -> nextp.equals(ent.getName())).findAny().orElse(null);
+
+
+				// If not link create and to to next
+				if (!e.isLink()) {
+					target.append(path.uptoSegment(i + 1)).toFile().mkdir();
+					continue;
+				}
+
+				IPath linkTarget = e.getLink().startsWith("/") ? new Path(e.getLink()) : curpath.append(e.getLink());
+
+				SymLink sl = new SymLink(target.append(path.uptoSegment(i + 1)).toFile(), linkTarget.toFile());
+
+				IPath rv = linkTarget.append(path.removeFirstSegments(i + 1));
+
+				if (!sl.targetExists()) {
+					rv = mkdirSyms(containerId, rv);
+				}
+
+				sl.create();
+				return rv;
+			}
+
+			return path;
+		}
+
+
+
 		@Override
 		protected IStatus run(final IProgressMonitor monitor) {
-			monitor.beginTask(Messages.getFormattedString(COPY_VOLUMES_FROM_DESC, image), volumes.size());
+			monitor.beginTask(Messages.getFormattedString(COPY_VOLUMES_FROM_DESC, image), volumes.size() + 1);
 			String containerId = null;
 			String currentVolume = null;
 			boolean isWin = Platform.getOS().equals(Platform.OS_WIN32);
+
+			Set<SymLink> symlinkBacklog = new HashSet<>(); // Needed because of windows
 
 			// keep a list of already copied/being copied volumes so we can skip them and
 			// wait at the end to
 			// make sure if another job was copying them, it has finished
 			List<String> alreadyCopiedList = new ArrayList<>();
 
-			try {
-				IDockerImage dockerImage = ((DockerConnection) connection).getImageByTag(image);
+			try (Closeable shelltoken = connection.getOperationToken()) {
+				IDockerImage dockerImage = connection.getImageByTag(image);
 				// if there is a .image_id file, check the image id to ensure
 				// the user hasn't loaded a new version which may have
 				// different header files installed.
@@ -356,12 +462,19 @@ public class ContainerLauncher {
 					return Status.OK_STATUS;
 				}
 
+
+				target.toFile().mkdirs();
+
 				// create base container to use for copying
-				DockerContainerConfig.Builder builder = new DockerContainerConfig.Builder().cmd("/bin/sh").image(image); //$NON-NLS-1$
+				DockerContainerConfig.Builder builder = new DockerContainerConfig.Builder().cmd("sleep infinity") //$NON-NLS-1$
+						.image(image);
 				IDockerContainerConfig config = builder.build();
 				DockerHostConfig.Builder hostBuilder = new DockerHostConfig.Builder();
 				IDockerHostConfig hostConfig = hostBuilder.build();
-				containerId = ((DockerConnection) connection).createContainer(config, hostConfig, null);
+				containerId = connection.createContainer(config, hostConfig, null);
+				connection.startContainer(shelltoken, containerId, null);
+
+
 
 				// copy each volume if it exists and is not copied over yet
 				for (String volume : volumes) {
@@ -418,11 +531,36 @@ public class ContainerLauncher {
 					// instead of returning too fast and the headers won't be
 					// there
 					synchronized (volume) {
-						try (Closeable token = ((DockerConnection) connection).getOperationToken()) {
+						try (Closeable token = connection.getOperationToken()) {
+
+							if (volume.contains("build")) {
+								Activator.logWarningMessage("Build");
+							}
+
 							monitor.setTaskName(Messages.getFormattedString(COPY_VOLUMES_FROM_TASK, volume));
 							monitor.worked(1);
 
-							InputStream in = ((DockerConnection) connection).copyContainer(token, containerId, volume);
+							// Get symlinks
+
+							IPath volDir = new Path(volume);
+
+							IPath realDir = mkdirSyms(containerId, volDir);
+
+
+							if (!volDir.equals(realDir)) {
+								List<String> pl = new ArrayList<>(1);
+								pl.add(realDir.toString());
+
+								CopyVolumesFromImageJob job = new CopyVolumesFromImageJob(connection, image, pl,
+										excludedDirs, target);
+								job.schedule();
+
+								job.join();
+
+								continue;
+							}
+
+							InputStream in = connection.copyContainer(token, containerId, volume);
 
 							synchronized (lockObject) {
 								if (!dirList.contains(volume)) {
@@ -433,6 +571,9 @@ public class ContainerLauncher {
 								}
 							}
 
+
+
+
 							/*
 							 * The input stream from copyContainer might be incomplete or non-blocking so we
 							 * should wrap it in a stream that is guaranteed to block until data is
@@ -440,8 +581,8 @@ public class ContainerLauncher {
 							 */
 							try (TarArchiveInputStream k = new TarArchiveInputStream(new BlockingInputStream(in))) {
 								TarArchiveEntry te = null;
-								target.toFile().mkdirs();
-								IPath currDir = target.append(volume).removeLastSegments(1);
+
+								final IPath currDir = target.append(volume).removeLastSegments(1);
 								currDir.toFile().mkdirs();
 								while ((te = k.getNextTarEntry()) != null) {
 									long size = te.getSize();
@@ -449,35 +590,105 @@ public class ContainerLauncher {
 									path = path.append(te.getName());
 									File f = new File(path.toOSString());
 									int mode = te.getMode();
-									if (te.isDirectory()) {
-										f.mkdir();
-										if (!isWin && !te.isSymbolicLink()) {
-											Files.setPosixFilePermissions(Paths.get(path.toOSString()), toPerms(mode));
+
+									// The Tar-Archive stuff is broken. Basically it checks whether the filename
+									// as a trailing slash and decides whether it is a file or a directory.
+									// Thus all other possible types must be checked first...
+
+									String basemsg = "Copying from Docker: ";
+
+									if(te.isLink()){
+										Activator.logWarningMessage(basemsg + "Links are not yet supported. " + volume + "/" + te.getName());
+										continue;
+									}
+									if(te.isCharacterDevice()){
+										Activator.logWarningMessage(basemsg + "Characte devices are not supported. " + volume + "/" + te.getName());
+										continue;
+									}
+									if(te.isBlockDevice()){
+										Activator.logWarningMessage(basemsg + "Block devices are not supported. " + volume + "/" + te.getName());
+										continue;
+									}
+									if(te.isFIFO()){
+										Activator.logWarningMessage(basemsg + "Fifos are not supported. " + volume + "/" + te.getName());
+										continue;
+									}
+
+
+									if (te.isSymbolicLink()) {
+										SymLink sl = new SymLink(f, volume, te);
+
+										if (!sl.create()) {
+											symlinkBacklog.add(sl);
 										}
 										continue;
-									} else {
-										if (".project".equals(te.getName())) { //$NON-NLS-1$
+									}
+
+
+									if (te.isDirectory()) {
+										if (f.exists()) {
+											if (!f.isDirectory()) {
+												Activator.logWarningMessage(
+														"Cannot create dir - is file: " + f.getAbsolutePath());
+											}
+											continue;
+
+										}
+										if (!f.mkdir()) {
+											Activator.logWarningMessage(
+													"Failed to create folder " + f.getAbsolutePath());
 											continue;
 										}
-										f.createNewFile();
 										if (!isWin && !te.isSymbolicLink()) {
-											Files.setPosixFilePermissions(Paths.get(path.toOSString()), toPerms(mode));
+											Files.setPosixFilePermissions(f.toPath(), toPerms(mode));
 										}
+										continue;
 									}
-									try (FileOutputStream os = new FileOutputStream(f)) {
-										int bufferSize = ((int) size > 4096 ? 4096 : (int) size);
-										byte[] barray = new byte[bufferSize];
-										int result = -1;
-										while ((result = k.read(barray, 0, bufferSize)) > -1) {
-											if (monitor.isCanceled()) {
-												monitor.done();
-												k.close();
-												os.close();
-												return Status.CANCEL_STATUS;
+
+									if (".project".equals(te.getName())) { //$NON-NLS-1$
+										continue;
+									}
+
+									if (te.isFile()) {
+
+										if (!f.exists()) {
+											try {
+												if (!f.createNewFile()) {
+													Activator.logWarningMessage(
+															"Failed to create " + f.getAbsolutePath());
+													continue;
+												}
+											} catch (IOException e) {
+												Activator.logErrorMessage("Failed to create " + f.getAbsolutePath(), e);
+												continue;
 											}
-											os.write(barray, 0, result);
 										}
+
+										if (!isWin) { // && !te.isSymbolicLink()
+											Files.setPosixFilePermissions(f.toPath(), toPerms(mode));
+										}
+
+										try (FileOutputStream os = new FileOutputStream(f)) {
+											int bufferSize = ((int) size > 4096 ? 4096 : (int) size);
+											byte[] barray = new byte[bufferSize];
+											int result = -1;
+											while ((result = k.read(barray, 0, bufferSize)) > -1) {
+												if (monitor.isCanceled()) {
+													monitor.done();
+													k.close();
+													os.close();
+													return Status.CANCEL_STATUS;
+												}
+												os.write(barray, 0, result);
+											}
+										}
+										continue;
 									}
+
+									Activator.logWarningMessage(basemsg + "This should not happen");
+
+
+
 								}
 							}
 							// remove from copying list so subsequent jobs might
@@ -487,7 +698,7 @@ public class ContainerLauncher {
 								copyingList.remove(currentVolume);
 							}
 						} catch (final DockerException e) {
-							// ignore
+							Activator.logErrorMessage("Something went wrong with docker", e);
 							synchronized (lockObject) {
 								copyingList.remove(currentVolume);
 								dirList.remove(currentVolume);
@@ -495,6 +706,37 @@ public class ContainerLauncher {
 						}
 					}
 				}
+
+				for (SymLink sl : symlinkBacklog) {
+
+					if (!sl.targetExists()) {
+						File get = sl.dockertarget;
+						if (get.isFile()) {
+							get = new File(get.getParent());
+						}
+						List<String> dir = new ArrayList<>();
+						dir.add(new Path(get.getPath()).toString());
+
+						CopyVolumesFromImageJob job = new CopyVolumesFromImageJob(connection, image, dir, excludedDirs,
+								target);
+						job.schedule();
+						try {
+							job.join();
+						} catch (Exception e) {
+							Activator.logErrorMessage("Failed to get " + get.getPath() + " from Docker.", e);
+							continue;
+						}
+
+					}
+
+					if (!sl.targetExists()) {
+						Activator.logWarningMessage("Failed to get " + sl.dockertarget + " from Docker.");
+					}
+
+					sl.create();
+				}
+				monitor.worked(1);
+
 			} catch (InterruptedException e) {
 				// do nothing
 			} catch (IOException | DockerException e) {
@@ -513,7 +755,7 @@ public class ContainerLauncher {
 				// remove the container used for copying
 				if (containerId != null) {
 					try {
-						((DockerConnection) connection).removeContainer(containerId);
+						connection.removeContainer(containerId);
 					} catch (DockerException | InterruptedException e) {
 						// ignore
 					}
@@ -592,7 +834,7 @@ public class ContainerLauncher {
 	/**
 	 * Perform a launch of a command in a container and output stdout/stderr to
 	 * console.
-	 * 
+	 *
 	 * @param id
 	 *            - id of caller to use to distinguish console owner
 	 * @param listener
@@ -635,7 +877,7 @@ public class ContainerLauncher {
 	/**
 	 * Perform a launch of a command in a container and output stdout/stderr to
 	 * console.
-	 * 
+	 *
 	 * @param id
 	 *            - id of caller to use to distinguish console owner
 	 * @param listener
@@ -681,7 +923,7 @@ public class ContainerLauncher {
 	/**
 	 * Perform a launch of a command in a container and output stdout/stderr to
 	 * console.
-	 * 
+	 *
 	 * @param id
 	 *            - id of caller to use to distinguish console owner
 	 * @param listener
@@ -749,7 +991,7 @@ public class ContainerLauncher {
 	/**
 	 * Perform a launch of a command in a container and output stdout/stderr to
 	 * console.
-	 * 
+	 *
 	 * @param id
 	 *            - id of caller to use to distinguish console owner
 	 * @param listener
@@ -804,7 +1046,7 @@ public class ContainerLauncher {
 	/**
 	 * Perform a launch of a command in a container and output stdout/stderr to
 	 * console.
-	 * 
+	 *
 	 * @param id
 	 *            - id of caller to use to distinguish console owner
 	 * @param listener
@@ -935,7 +1177,7 @@ public class ContainerLauncher {
 
 		// Try and use the specified connection that was used before,
 		// otherwise, open an error
-		final IDockerConnection connection = DockerConnectionManager
+		final DockerConnection connection = (DockerConnection) DockerConnectionManager
 				.getInstance().getConnectionByUri(connectionUri);
 		if (connection == null) {
 			Display.getDefault()
@@ -981,7 +1223,7 @@ public class ContainerLauncher {
 
 
 		final Map<String, String> remoteVolumes = new HashMap<>();
-		if (!((DockerConnection) connection).isLocal()) {
+		if (!connection.isLocal()) {
 			@SuppressWarnings("rawtypes")
 			final Map<String,Map> volumes = new HashMap<>();
 			// if using remote daemon, we have to
@@ -1027,7 +1269,7 @@ public class ContainerLauncher {
 		final IDockerHostConfig hostConfig = hostBuilder.build();
 
 		if (image.equals(imageInfo.id())) {
-			IDockerImage dockerImage = ((DockerConnection) connection).getImage(image);
+			IDockerImage dockerImage = connection.getImage(image);
 			image = dockerImage.repoTags().get(0);
 		}
 
@@ -1040,9 +1282,9 @@ public class ContainerLauncher {
 			// create the container
 			String containerId = null;
 			try {
-				containerId = ((DockerConnection) connection)
+				containerId = connection
 						.createContainer(config, hostConfig, null);
-				if (!((DockerConnection) connection).isLocal()) {
+				if (!connection.isLocal()) {
 					// if daemon is remote, we need to copy
 					// data over from the host.
 					if (!remoteVolumes.isEmpty()) {
@@ -1093,15 +1335,15 @@ public class ContainerLauncher {
 						out.addConsoleListener(new RunConsoleListenerBridge(
 								containerListener));
 					}
-					((DockerConnection) connection).startContainer(containerId,
+					connection.startContainer(containerId,
 							null, null);
-					IDockerContainerInfo info = ((DockerConnection) connection)
+					IDockerContainerInfo info = connection
 							.getContainerInfo(containerId);
 					if (containerListener != null) {
 						containerListener.containerInfo(info);
 					}
 					// Wait for the container to finish
-					final IDockerContainerExit status = ((DockerConnection) connection)
+					final IDockerContainerExit status = connection
 							.waitForContainer(containerId);
 					Display.getDefault().syncExec(() -> {
 						rc.setTitle(
@@ -1139,7 +1381,7 @@ public class ContainerLauncher {
 						containerListener.done();
 
 					if (!keepContainer) {
-						((DockerConnection) connection)
+						connection
 								.removeContainer(containerId);
 					}
 				} else {
@@ -1167,18 +1409,18 @@ public class ContainerLauncher {
 					// Create a unique logging thread id which has container id
 					// and console id
 					String loggingId = containerId + "." + consoleId;
-					((DockerConnection) connection).startContainer(containerId,
+					connection.startContainer(containerId,
 							loggingId, stream);
 					if (rc != null)
 						rc.showConsole();
 					if (containerListener != null) {
-						IDockerContainerInfo info = ((DockerConnection) connection)
+						IDockerContainerInfo info = connection
 								.getContainerInfo(containerId);
 						containerListener.containerInfo(info);
 					}
 
 					// Wait for the container to finish
-					final IDockerContainerExit status = ((DockerConnection) connection)
+					final IDockerContainerExit status = connection
 							.waitForContainer(containerId);
 					Display.getDefault().syncExec(() -> {
 						rc.setTitle(
@@ -1198,17 +1440,17 @@ public class ContainerLauncher {
 						// Drain the logging thread before we remove the
 						// container (we need to use the logging id)
 						Thread.sleep(1000);
-						((DockerConnection) connection)
+						connection
 								.stopLoggingThread(loggingId);
 						// Look for any Display Log console that the user may
 						// have opened which would be
 						// separate and make sure it is removed as well
 						RunConsole rc2 = RunConsole
-								.findConsole(((DockerConnection) connection)
+								.findConsole(connection
 										.getContainer(containerId));
 						if (rc2 != null)
 							RunConsole.removeConsole(rc2);
-						((DockerConnection) connection)
+						connection
 								.removeContainer(containerId);
 					}
 				}
@@ -1217,7 +1459,7 @@ public class ContainerLauncher {
 				// error in creation, try and remove Container if possible
 				if (!keepContainer && containerId != null) {
 					try {
-						((DockerConnection) connection)
+						connection
 								.removeContainer(containerId);
 					} catch (DockerException | InterruptedException e1) {
 						// ignore exception
@@ -1233,7 +1475,7 @@ public class ContainerLauncher {
 				// for now
 				// do nothing
 			}
-			((DockerConnection) connection).getContainers(true);
+			connection.getContainers(true);
 		});
 		t.start();
 	}
@@ -1258,7 +1500,7 @@ public class ContainerLauncher {
 
 	/**
 	 * Fetch directories from Container and place them in a specified location.
-	 * 
+	 *
 	 * @param connectionUri
 	 *            - uri of connection to use
 	 * @param imageName
@@ -1268,14 +1510,14 @@ public class ContainerLauncher {
 	 * @param hostDir
 	 *            - host directory to copy directories to
 	 * @return 0 if successful, -1 if failure occurred
-	 * 
+	 *
 	 * @since 3.0
 	 */
 	public int fetchContainerDirs(String connectionUri, String imageName,
 			List<String> containerDirs, IPath hostDir) {
 		// Try and use the specified connection that was used before,
 		// otherwise, open an error
-		final IDockerConnection connection = DockerConnectionManager
+		final DockerConnection connection = (DockerConnection) DockerConnectionManager
 				.getInstance().getConnectionByUri(connectionUri);
 		if (connection == null) {
 			Display.getDefault()
@@ -1297,7 +1539,7 @@ public class ContainerLauncher {
 
 	/**
 	 * Fetch directories from Container and place them in a specified location.
-	 * 
+	 *
 	 * @param connectionUri
 	 *            - uri of connection to use
 	 * @param imageName
@@ -1309,14 +1551,14 @@ public class ContainerLauncher {
 	 * @param hostDir
 	 *            - host directory to copy directories to
 	 * @return 0 if successful, -1 if failure occurred
-	 * 
+	 *
 	 * @since 4.0
 	 */
 	public int fetchContainerDirs(String connectionUri, String imageName,
 			List<String> containerDirs, List<String> excludedDirs, IPath hostDir) {
 		// Try and use the specified connection that was used before,
 		// otherwise, open an error
-		final IDockerConnection connection = DockerConnectionManager
+		final DockerConnection connection = (DockerConnection) DockerConnectionManager
 				.getInstance().getConnectionByUri(connectionUri);
 		if (connection == null) {
 			Display.getDefault()
@@ -1339,7 +1581,7 @@ public class ContainerLauncher {
 	/**
 	 * Fetch directories from Container and place them in a specified location.
 	 * This method will wait for copy job to complete before returning.
-	 * 
+	 *
 	 * @param connectionUri
 	 *            - uri of connection to use
 	 * @param imageName
@@ -1349,14 +1591,14 @@ public class ContainerLauncher {
 	 * @param hostDir
 	 *            - host directory to copy directories to
 	 * @return 0 if successful, -1 if failure occurred
-	 * 
+	 *
 	 * @since 4.0
 	 */
 	public int fetchContainerDirsSync(String connectionUri, String imageName,
 			List<String> containerDirs, IPath hostDir) {
 		// Try and use the specified connection that was used before,
 		// otherwise, open an error
-		final IDockerConnection connection = DockerConnectionManager
+		final DockerConnection connection = (DockerConnection) DockerConnectionManager
 				.getInstance().getConnectionByUri(connectionUri);
 		if (connection == null) {
 			Display.getDefault()
@@ -1384,7 +1626,7 @@ public class ContainerLauncher {
 	/**
 	 * Fetch directories from Container and place them in a specified location.
 	 * This method will wait for copy job to complete before returning.
-	 * 
+	 *
 	 * @param connectionUri
 	 *            - uri of connection to use
 	 * @param imageName
@@ -1394,7 +1636,7 @@ public class ContainerLauncher {
 	 * @param hostDir
 	 *            - host directory to copy directories to
 	 * @return 0 if successful, -1 if failure occurred
-	 * 
+	 *
 	 * @since 4.0
 	 */
 	public int fetchContainerDirsSync(String connectionUri, String imageName,
@@ -1402,7 +1644,7 @@ public class ContainerLauncher {
 			IPath hostDir) {
 		// Try and use the specified connection that was used before,
 		// otherwise, open an error
-		final IDockerConnection connection = DockerConnectionManager
+		final DockerConnection connection = (DockerConnection) DockerConnectionManager
 				.getInstance().getConnectionByUri(connectionUri);
 		if (connection == null) {
 			Display.getDefault()
@@ -1430,7 +1672,7 @@ public class ContainerLauncher {
 	/**
 	 * Create a Process to run an arbitrary command in a Container with uid of
 	 * caller so any files created are accessible to user.
-	 * 
+	 *
 	 * @param connectionName
 	 *            - uri of connection to use
 	 * @param imageName
@@ -1461,10 +1703,10 @@ public class ContainerLauncher {
 	 *            - boolean whether to keep Container when done
 	 * @return Process that can be used to check for completion and for routing
 	 *         stdout/stderr
-	 * 
+	 *
 	 * @since 3.0
 	 */
-	public Process runCommand(String connectionName, String imageName, IProject project, 
+	public Process runCommand(String connectionName, String imageName, IProject project,
 			IErrorMessageHolder errMsgHolder, String command,
 			@SuppressWarnings("unused") String commandDir,
 			String workingDir,
@@ -1472,7 +1714,7 @@ public class ContainerLauncher {
 			Properties envMap, boolean supportStdin,
 			boolean privilegedMode, HashMap<String, String> labels,
 			boolean keepContainer) {
-		
+
 		final List<String> cmdList = getCmdList(command);
 		return runCommand(connectionName, imageName, project, errMsgHolder,
 				cmdList, workingDir, additionalDirs, origEnv, envMap,
@@ -1482,7 +1724,7 @@ public class ContainerLauncher {
 	/**
 	 * Create a Process to run an arbitrary command in a Container with uid of
 	 * caller so any files created are accessible to user.
-	 * 
+	 *
 	 * @param connectionName
 	 *            - uri of connection to use
 	 * @param imageName
@@ -1511,7 +1753,7 @@ public class ContainerLauncher {
 	 *            - boolean whether to keep Container when done
 	 * @return Process that can be used to check for completion and for routing
 	 *         stdout/stderr
-	 * 
+	 *
 	 * @since 4.0
 	 */
 	public Process runCommand(String connectionName, String imageName,
@@ -1566,10 +1808,10 @@ public class ContainerLauncher {
 			return null;
 		}
 
-		IDockerConnection connection = null;
+		DockerConnection connection = null;
 		for (IDockerConnection c : connections) {
 			if (c.getUri().equals(connectionName)) {
-				connection = c;
+				connection = (DockerConnection) c;
 				break;
 			}
 		}
@@ -1613,7 +1855,7 @@ public class ContainerLauncher {
 				id += ":" + gid.toString(); //$NON-NLS-1$
 			builder = builder.user(id);
 		}
-		
+
 		// TODO: add group id here when supported by DockerHostConfig.Builder
 
 		// add any labels if specified
@@ -1630,7 +1872,7 @@ public class ContainerLauncher {
 		final Map<String, Map> remoteVolumes = new HashMap<>();
 		final Map<String, String> remoteDataVolumes = new HashMap<>();
 		final Set<String> readOnlyVolumes = new TreeSet<>();
-		if (!((DockerConnection) connection).isLocal()) {
+		if (!connection.isLocal()) {
 			// if using remote daemon, we have to
 			// handle volume mounting differently.
 			// Instead we mount empty volumes and copy
@@ -1671,7 +1913,7 @@ public class ContainerLauncher {
 			// don't need to copy data over and can simply bind to the volume.
 			try {
 				final List<String> volumes = new ArrayList<>();
-				List<IDockerVolume> volumeList = ((DockerConnection) connection).getVolumes();
+				List<IDockerVolume> volumeList = connection.getVolumes();
 				for (IDockerVolume volume : volumeList) {
 					String name = volume.name();
 					String containerDir = remoteDataVolumes.get(name);
@@ -1768,7 +2010,7 @@ public class ContainerLauncher {
 		// create the container
 		String containerId = null;
 		try {
-			containerId = ((DockerConnection) connection)
+			containerId = connection
 					.createContainer(config, hostConfig, null);
 			// Add delay after creating container to fix bug 546505
 			Thread.sleep(100);
@@ -1776,10 +2018,10 @@ public class ContainerLauncher {
 			errMsgHolder.setErrorMessage(e.getMessage());
 			return null;
 		}
-		
+
 		final String id = containerId;
-		final IDockerConnection conn = connection;
-		if (!((DockerConnection) conn).isLocal()) {
+		final DockerConnection conn = connection;
+		if (!conn.isLocal()) {
 			// if daemon is remote, we need to copy
 			// data over from the host.
 			if (!remoteVolumes.isEmpty()) {
@@ -1807,7 +2049,7 @@ public class ContainerLauncher {
 
 	/**
 	 * Clean up the container used for launching
-	 * 
+	 *
 	 * @param connectionUri
 	 *            the URI of the connection used
 	 * @param info
@@ -1833,7 +2075,7 @@ public class ContainerLauncher {
 
 	/**
 	 * Get the reusable run console for running C/C++ executables in containers.
-	 * 
+	 *
 	 * @return
 	 */
 	private RunConsole getConsole() {
@@ -1846,7 +2088,7 @@ public class ContainerLauncher {
 
 	/**
 	 * Take the command string and parse it into a list of strings.
-	 * 
+	 *
 	 * @param s
 	 * @return list of strings
 	 */
@@ -1910,7 +2152,7 @@ public class ContainerLauncher {
 	/**
 	 * Convert map of environment variables to a {@link List} of KEY=VALUE
 	 * String
-	 * 
+	 *
 	 * @param variables
 	 *            the entries to manipulate
 	 * @return the concatenated key/values for each given variable entry
@@ -1937,13 +2179,13 @@ public class ContainerLauncher {
 	/**
 	 * Get set of volumes that have been copied from Container to Host as part
 	 * of fetchContainerDirs method.
-	 * 
+	 *
 	 * @param connectionName
 	 *            - uri of connection used
 	 * @param imageName
 	 *            - name of image used
 	 * @return set of paths copied from Container to Host
-	 * 
+	 *
 	 * @since 3.0
 	 */
 	public Set<String> getCopiedVolumes(String connectionName,
