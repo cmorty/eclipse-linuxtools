@@ -102,6 +102,8 @@ public class ContainerLauncher {
 	private static Map<String, Map<String, Set<String>>> copiedVolumesMap = null;
 	private static Map<String, Map<String, Set<String>>> copyingVolumesMap = null;
 
+	private final static boolean isWin = Platform.getOS().equals(Platform.OS_WIN32);
+
 
 	private static Set<PosixFilePermission> toPerms(int mode) {
 		Set<PosixFilePermission> perms = new HashSet<>();
@@ -277,7 +279,6 @@ public class ContainerLauncher {
 			public final File dockertarget;
 			public final File targetpath;
 
-			@SuppressWarnings("unused")
 			public SymLink(File filename, File dockertarget) {
 				this.filename = filename;
 				this.dockertarget = dockertarget;
@@ -370,13 +371,129 @@ public class ContainerLauncher {
 		}
 
 
+		private void copyTar(String volume, InputStream in, Set<SymLink> symlinkBacklog, final IProgressMonitor monitor)
+				throws IOException {
+
+			final IPath currDir = target.append(volume).removeLastSegments(1);
+			currDir.toFile().mkdirs();
+
+			/*
+			 * The input stream from copyContainer might be incomplete or non-blocking so we
+			 * should wrap it in a stream that is guaranteed to block until data is
+			 * available.
+			 */
+			try (TarArchiveInputStream k = new TarArchiveInputStream(new BlockingInputStream(in))) {
+				TarArchiveEntry te = null;
+
+
+				while ((te = k.getNextTarEntry()) != null) {
+					long size = te.getSize();
+					IPath path = currDir;
+					path = path.append(te.getName());
+					File f = new File(path.toOSString());
+					int mode = te.getMode();
+
+					// The Tar-Archive stuff is broken. Basically it checks whether the filename
+					// as a trailing slash and decides whether it is a file or a directory.
+					// Thus all other possible types must be checked first...
+
+					String basemsg = "Copying from Docker: ";
+
+					if(te.isLink()){
+						Activator.logWarningMessage(basemsg + "Links are not yet supported. " + volume + "/" + te.getName());
+						continue;
+					}
+					if(te.isCharacterDevice()){
+						Activator.logWarningMessage(basemsg + "Characte devices are not supported. " + volume + "/" + te.getName());
+						continue;
+					}
+					if(te.isBlockDevice()){
+						Activator.logWarningMessage(basemsg + "Block devices are not supported. " + volume + "/" + te.getName());
+						continue;
+					}
+					if(te.isFIFO()){
+						Activator.logWarningMessage(basemsg + "Fifos are not supported. " + volume + "/" + te.getName());
+						continue;
+					}
+
+
+					if (te.isSymbolicLink()) {
+						SymLink sl = new SymLink(f, volume, te);
+
+						if (!sl.create()) {
+							symlinkBacklog.add(sl);
+						}
+						continue;
+					}
+
+
+					if (te.isDirectory()) {
+						if (f.exists()) {
+							if (!f.isDirectory()) {
+								Activator.logWarningMessage(
+										"Cannot create dir - is file: " + f.getAbsolutePath());
+							}
+							continue;
+
+						}
+						if (!f.mkdir()) {
+							Activator.logWarningMessage(
+									"Failed to create folder " + f.getAbsolutePath());
+							continue;
+						}
+						if (!isWin && !te.isSymbolicLink()) {
+							Files.setPosixFilePermissions(f.toPath(), toPerms(mode));
+						}
+						continue;
+					}
+
+					if (".project".equals(te.getName())) { //$NON-NLS-1$
+						continue;
+					}
+
+					if (te.isFile()) {
+
+						if (!f.exists()) {
+							try {
+								if (!f.createNewFile()) {
+									Activator.logWarningMessage(
+											"Failed to create " + f.getAbsolutePath());
+									continue;
+								}
+							} catch (IOException e) {
+								Activator.logErrorMessage("Failed to create " + f.getAbsolutePath(), e);
+								continue;
+							}
+						}
+
+						if (!isWin) { // && !te.isSymbolicLink()
+							Files.setPosixFilePermissions(f.toPath(), toPerms(mode));
+						}
+
+						try (FileOutputStream os = new FileOutputStream(f)) {
+							int bufferSize = ((int) size > 4096 ? 4096 : (int) size);
+							byte[] barray = new byte[bufferSize];
+							int result = -1;
+							while ((result = k.read(barray, 0, bufferSize)) > -1) {
+								if (monitor.isCanceled()) {
+									throw new RuntimeException("Tar-File entey does not have expected size.");
+								}
+								os.write(barray, 0, result);
+							}
+						}
+						continue;
+					}
+
+					throw new RuntimeException("Unsuppoerted Tar-File entry that should not exist");
+				}
+			}
+		}
 
 		@Override
 		protected IStatus run(final IProgressMonitor monitor) {
 			monitor.beginTask(Messages.getFormattedString(COPY_VOLUMES_FROM_DESC, image), volumes.size() + 1);
 			String containerId = null;
 			String currentVolume = null;
-			boolean isWin = Platform.getOS().equals(Platform.OS_WIN32);
 
 			Set<SymLink> symlinkBacklog = new HashSet<>(); // Needed because of windows
 
@@ -466,7 +583,8 @@ public class ContainerLauncher {
 				target.toFile().mkdirs();
 
 				// create base container to use for copying
-				DockerContainerConfig.Builder builder = new DockerContainerConfig.Builder().cmd("sleep infinity") //$NON-NLS-1$
+				// TODO write explatnation
+				DockerContainerConfig.Builder builder = new DockerContainerConfig.Builder().cmd("sleep 3600") //$NON-NLS-1$
 						.image(image);
 				IDockerContainerConfig config = builder.build();
 				DockerHostConfig.Builder hostBuilder = new DockerHostConfig.Builder();
@@ -540,10 +658,18 @@ public class ContainerLauncher {
 							monitor.setTaskName(Messages.getFormattedString(COPY_VOLUMES_FROM_TASK, volume));
 							monitor.worked(1);
 
+							synchronized (lockObject) {
+								if (!dirList.contains(volume)) {
+									dirList.add(volume);
+									copyingList.add(volume);
+								} else {
+									continue;
+								}
+							}
+
 							// Get symlinks
 
 							IPath volDir = new Path(volume);
-
 							IPath realDir = mkdirSyms(containerId, volDir);
 
 
@@ -557,139 +683,9 @@ public class ContainerLauncher {
 
 								job.join();
 
-								continue;
-							}
-
-							InputStream in = connection.copyContainer(token, containerId, volume);
-
-							synchronized (lockObject) {
-								if (!dirList.contains(volume)) {
-									dirList.add(volume);
-									copyingList.add(volume);
-								} else {
-									continue;
-								}
-							}
-
-
-
-
-							/*
-							 * The input stream from copyContainer might be incomplete or non-blocking so we
-							 * should wrap it in a stream that is guaranteed to block until data is
-							 * available.
-							 */
-							try (TarArchiveInputStream k = new TarArchiveInputStream(new BlockingInputStream(in))) {
-								TarArchiveEntry te = null;
-
-								final IPath currDir = target.append(volume).removeLastSegments(1);
-								currDir.toFile().mkdirs();
-								while ((te = k.getNextTarEntry()) != null) {
-									long size = te.getSize();
-									IPath path = currDir;
-									path = path.append(te.getName());
-									File f = new File(path.toOSString());
-									int mode = te.getMode();
-
-									// The Tar-Archive stuff is broken. Basically it checks whether the filename
-									// as a trailing slash and decides whether it is a file or a directory.
-									// Thus all other possible types must be checked first...
-
-									String basemsg = "Copying from Docker: ";
-
-									if(te.isLink()){
-										Activator.logWarningMessage(basemsg + "Links are not yet supported. " + volume + "/" + te.getName());
-										continue;
-									}
-									if(te.isCharacterDevice()){
-										Activator.logWarningMessage(basemsg + "Characte devices are not supported. " + volume + "/" + te.getName());
-										continue;
-									}
-									if(te.isBlockDevice()){
-										Activator.logWarningMessage(basemsg + "Block devices are not supported. " + volume + "/" + te.getName());
-										continue;
-									}
-									if(te.isFIFO()){
-										Activator.logWarningMessage(basemsg + "Fifos are not supported. " + volume + "/" + te.getName());
-										continue;
-									}
-
-
-									if (te.isSymbolicLink()) {
-										SymLink sl = new SymLink(f, volume, te);
-
-										if (!sl.create()) {
-											symlinkBacklog.add(sl);
-										}
-										continue;
-									}
-
-
-									if (te.isDirectory()) {
-										if (f.exists()) {
-											if (!f.isDirectory()) {
-												Activator.logWarningMessage(
-														"Cannot create dir - is file: " + f.getAbsolutePath());
-											}
-											continue;
-
-										}
-										if (!f.mkdir()) {
-											Activator.logWarningMessage(
-													"Failed to create folder " + f.getAbsolutePath());
-											continue;
-										}
-										if (!isWin && !te.isSymbolicLink()) {
-											Files.setPosixFilePermissions(f.toPath(), toPerms(mode));
-										}
-										continue;
-									}
-
-									if (".project".equals(te.getName())) { //$NON-NLS-1$
-										continue;
-									}
-
-									if (te.isFile()) {
-
-										if (!f.exists()) {
-											try {
-												if (!f.createNewFile()) {
-													Activator.logWarningMessage(
-															"Failed to create " + f.getAbsolutePath());
-													continue;
-												}
-											} catch (IOException e) {
-												Activator.logErrorMessage("Failed to create " + f.getAbsolutePath(), e);
-												continue;
-											}
-										}
-
-										if (!isWin) { // && !te.isSymbolicLink()
-											Files.setPosixFilePermissions(f.toPath(), toPerms(mode));
-										}
-
-										try (FileOutputStream os = new FileOutputStream(f)) {
-											int bufferSize = ((int) size > 4096 ? 4096 : (int) size);
-											byte[] barray = new byte[bufferSize];
-											int result = -1;
-											while ((result = k.read(barray, 0, bufferSize)) > -1) {
-												if (monitor.isCanceled()) {
-													monitor.done();
-													k.close();
-													os.close();
-													return Status.CANCEL_STATUS;
-												}
-												os.write(barray, 0, result);
-											}
-										}
-										continue;
-									}
-
-									Activator.logWarningMessage(basemsg + "This should not happen");
-
-
-
-								}
+							} else {
+								InputStream in = connection.copyContainer(token, containerId, volume);
+								copyTar(volume, in, symlinkBacklog, monitor);
 							}
 							// remove from copying list so subsequent jobs might
 							// know that the volume
